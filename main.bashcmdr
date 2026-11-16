@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# NVM Loader Cartridge - Standardized Interface
+# Node.js version management integration
+# Part of the bashcmdr cartridge management system
+
+# Framework libraries are optional for bare-checkout help/setup/diagnosis.
+# Activation still requires the console's manifest guard.
+NVM_CARTRIDGE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -r $NVM_CARTRIDGE_ROOT/../../lib/core.bashcmdr ]]; then
+    # shellcheck source=/dev/null
+    source "$NVM_CARTRIDGE_ROOT/../../lib/core.bashcmdr" || return 1
+fi
+if [[ -r $NVM_CARTRIDGE_ROOT/../../lib/guards.bashcmdr ]]; then
+    # shellcheck source=/dev/null
+    source "$NVM_CARTRIDGE_ROOT/../../lib/guards.bashcmdr" || return 1
+fi
+
+# Console callbacks source this file inside a function. Public helpers outlive
+# that callback, so their shared associative context must live in global scope.
+declare -gA NVM_CONFIG=()
+_nvm_message() {
+    local kind="$1" text="$2" callback="__bashcmdr_$1"
+    if declare -F "$callback" >/dev/null; then
+        "$callback" "$text"
+    elif [[ $kind == error ]]; then
+        printf 'NVM: %s\n' "$text" >&2
+    else
+        printf 'NVM: %s\n' "$text"
+    fi
+}
+
+_nvm_writable_scalar() {
+    local name declaration
+    for name in "$@"; do
+        if declaration=$(declare -p "$name" 2>/dev/null); then
+            case "$declaration" in
+                'declare -- '*|'declare -x '*) continue ;;
+            esac
+            _nvm_message error "Requires an ordinary writable scalar: $name"
+            return 1
+        fi
+    done
+    return 0
+}
+
+_nvm_configure() {
+    local directory="${NVM_DIR:-${HOME}/.nvm}"
+    # Use Bash/Unix shell path syntax, including MSYS/Cygwin mount paths.
+    if [[ $directory != /* || $directory == *$'\n'* || $directory == *$'\r'* ]]; then
+        _nvm_message error "NVM_DIR must be an absolute Bash path: $directory"
+        return 1
+    fi
+    while [[ $directory == */ && $directory != / ]]; do directory=${directory%/}; done
+    NVM_CONFIG[dir]=$directory
+    NVM_CONFIG[script]=$directory/nvm.sh
+    NVM_CONFIG[completion]=$directory/bash_completion
+}
+
+declare -A NVM_INTERFACE=(
+    [setup]="nvm_setup"
+    [activate]="nvm_activate"
+    [deactivate]="nvm_deactivate"
+    [diagnose]="nvm_diagnose"
+    [help]="nvm_help"
+)
+
+# === CATEGORY 1: Required Interface Functions ===
+
+nvm_setup() {
+    _nvm_configure || return 1
+    if [[ ! -d ${NVM_CONFIG[dir]} ]]; then
+        _nvm_message info "NVM not installed at ${NVM_CONFIG[dir]}; see nvm_help"
+        return 0
+    fi
+    if [[ ! -f ${NVM_CONFIG[script]} || ! -r ${NVM_CONFIG[script]} || ! -s ${NVM_CONFIG[script]} ]]; then
+        _nvm_message error "NVM script must be a readable nonempty file: ${NVM_CONFIG[script]}"
+        return 1
+    fi
+    _nvm_message success "NVM script present; activation has not been tested"
+}
+
+nvm_activate() {
+    local status version
+    if ! declare -F bashcmdr_guard_validate >/dev/null; then
+        _nvm_message error "Activation requires the Bash Commander console guard; bare checkout supports help/setup/diagnose"
+        return 1
+    fi
+    bashcmdr_guard_validate "nvm-loader" "$NVM_CARTRIDGE_ROOT/manifest.json" || return $?
+    _nvm_writable_scalar NVM_DIR PATH MANPATH NODE_PATH NVM_BIN NVM_INC BASHCMDR_NVM_LOADED || return 1
+    unset BASHCMDR_NVM_LOADED
+    _nvm_configure || return 1
+    if [[ ! -d ${NVM_CONFIG[dir]} ]]; then
+        _nvm_message info "NVM not installed; skipping activation (see nvm_help)"
+        return 0
+    fi
+    if [[ ! -f ${NVM_CONFIG[script]} || ! -r ${NVM_CONFIG[script]} || ! -s ${NVM_CONFIG[script]} ]]; then
+        _nvm_message error "NVM script must be a readable nonempty file: ${NVM_CONFIG[script]}"
+        return 1
+    fi
+    # Do not replace a caller's nonempty configuration, including trailing slash.
+    if [[ -z ${NVM_DIR:-} ]]; then export NVM_DIR="${NVM_CONFIG[dir]}"; fi
+    export NVM_DIR
+    # Re-source on each activation: exported markers do not establish child state.
+    # Explicit empty arguments prevent caller action arguments reaching upstream.
+    # shellcheck source=/dev/null
+    if source "${NVM_CONFIG[script]}" ""; then :; else
+        status=$?
+        _nvm_message error "NVM source failed ($status); upstream partial effects may remain"
+        return "$status"
+    fi
+    if ! declare -F nvm >/dev/null; then
+        _nvm_message error "NVM script did not provide the nvm function"
+        return 1
+    fi
+    if version=$(nvm --version 2>/dev/null) && [[ -n $version ]]; then :; else
+        _nvm_message error "Loaded nvm failed its version probe"
+        return 1
+    fi
+    if [[ -e ${NVM_CONFIG[completion]} ]]; then
+        if [[ ! -f ${NVM_CONFIG[completion]} || ! -r ${NVM_CONFIG[completion]} ]]; then
+            _nvm_message error "NVM completion is not a readable file"
+            return 1
+        fi
+        # shellcheck source=/dev/null
+        if source "${NVM_CONFIG[completion]}" ""; then :; else
+            status=$?
+            _nvm_message error "NVM completion failed ($status); upstream partial effects may remain"
+            return "$status"
+        fi
+    fi
+    export BASHCMDR_NVM_LOADED=1
+    _nvm_message success "NVM environment activated ($version)"
+}
+
+# === NVM HOOK FUNCTIONS ===
+
+# User-owned link directory; system-wide integration requires separate administration.
+_nvm_link_directory() {
+    local directory="${1:-${BASHCMDR_NVM_LINK_DIR:-${HOME}/.local/bin}}"
+    while [[ $directory == */ && $directory != / ]]; do directory=${directory%/}; done
+    case "$directory" in
+        /|/bin|/sbin|/usr/bin|/usr/sbin|/usr/local/bin|/usr/local/sbin)
+            printf 'ERROR: Choose a user-owned NVM link directory, not %s\n' "$directory" >&2
+            return 1 ;;
+    esac
+    if [[ $directory != /* ]]; then
+        printf 'ERROR: NVM link directory must be an absolute path\n' >&2
+        return 1
+    fi
+    printf '%s\n' "$directory"
+}
+
+# Recognize only absolute links into this NVM tree, with matching bin basenames.
+_nvm_link_is_managed() {
+    local link="$1" nvm_root="$2" name="$3" target relative version
+    [[ -L $link ]] || return 1
+    target=$(readlink "$link") || return 1
+    [[ $target == "$nvm_root/versions/node/"* ]] || return 1
+    relative=${target#"$nvm_root/versions/node/"}
+    version=${relative%%/*}
+    [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]] &&
+        [[ $relative == "$version/bin/$name" ]]
+}
+
+# Synchronize user-local links. Subshell scope confines glob settings and cleanup.
+_nvm_post_use_hook() (
+    local nvm_root node_version nvm_bin_dir link_dir lock_dir source destination name status
+    local failures=0
+    local -a executables=()
+    if [[ -z ${NVM_DIR:-} || ! -f ${NVM_DIR}/nvm.sh ]] || ! declare -F nvm >/dev/null; then
+        printf 'ERROR [1]: Load NVM before synchronizing links\n' >&2
+        return 1
+    fi
+    nvm_root=$(cd -P -- "$NVM_DIR" && pwd) || return 1
+    if node_version=$(nvm current); then :; else return $?; fi
+    if [[ ! $node_version =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]; then
+        printf 'ERROR [2]: No valid NVM-managed Node.js version is active\n' >&2
+        return 2
+    fi
+    nvm_bin_dir="$nvm_root/versions/node/$node_version/bin"
+    if [[ ! -d $nvm_bin_dir ]]; then
+        printf 'ERROR: NVM bin directory not found: %s\n' "$nvm_bin_dir" >&2
+        return 1
+    fi
+    unset GLOBIGNORE
+    shopt -u failglob
+    shopt -s nullglob dotglob
+    for source in "$nvm_bin_dir"/*; do
+        if [[ -f $source && -x $source ]]; then executables+=("$source"); fi
+    done
+    if (( ${#executables[@]} == 0 )); then
+        printf 'ERROR [127]: No executable files in the active NVM bin directory\n' >&2
+        return 127
+    fi
+    link_dir=$(_nvm_link_directory) || return 1
+    if [[ -L $link_dir || ( -e $link_dir && ! -d $link_dir ) ]]; then
+        printf 'ERROR: NVM link directory must be a real user-owned directory: %s\n' "$link_dir" >&2
+        return 1
+    fi
+    mkdir -p -- "$link_dir" || return 1
+    if [[ ! -O $link_dir || ! -w $link_dir ]]; then
+        printf 'ERROR: NVM link directory must be owned and writable by the current user: %s\n' "$link_dir" >&2
+        return 1
+    fi
+    link_dir=$(cd -P -- "$link_dir" && pwd) || return 1
+    _nvm_link_directory "$link_dir" >/dev/null || return 1
+    lock_dir="$link_dir/.bashcmdr-nvm.lock"
+    if ! mkdir -- "$lock_dir"; then
+        printf 'ERROR: NVM link synchronization is already locked: %s\n' "$lock_dir" >&2
+        return 1
+    fi
+    trap 'status=$?; if ! rmdir -- "$lock_dir"; then printf "ERROR: Could not release NVM link lock\n" >&2; exit 1; fi; exit "$status"' EXIT
+
+    # Check every current-name conflict before changing any managed links.
+    for source in "${executables[@]}"; do
+        name=${source##*/}; destination="$link_dir/$name"
+        if [[ -e $destination || -L $destination ]]; then
+            if ! _nvm_link_is_managed "$destination" "$nvm_root" "$name"; then
+                printf 'ERROR: Preserving foreign NVM-link name: %s\n' "$destination" >&2
+                failures=1
+            fi
+        fi
+    done
+    (( failures == 0 )) || return 1
+
+    # Delete only recognized links whose executable is absent in the new version.
+    for destination in "$link_dir"/*; do
+        name=${destination##*/}
+        if _nvm_link_is_managed "$destination" "$nvm_root" "$name"; then
+            if [[ ! -f $nvm_bin_dir/$name || ! -x $nvm_bin_dir/$name ]]; then
+                if ! rm -- "$destination"; then failures=1; fi
+            fi
+        fi
+    done
+    for source in "${executables[@]}"; do
+        name=${source##*/}; destination="$link_dir/$name"
+        if [[ -e $destination || -L $destination ]]; then
+            if ! _nvm_link_is_managed "$destination" "$nvm_root" "$name"; then
+                printf 'ERROR: Preserving changed/foreign link name: %s\n' "$destination" >&2
+                failures=1; continue
+            fi
+            if [[ $(readlink "$destination") == "$source" ]]; then continue; fi
+            if ! rm -- "$destination"; then failures=1; continue; fi
+        fi
+        if ! ln -s -- "$source" "$destination"; then failures=1; fi
+    done
+    if (( failures != 0 )); then
+        printf 'ERROR: NVM link synchronization incomplete; inspect %s before retrying\n' "$link_dir" >&2
+        return 1
+    fi
+    printf 'SUCCESS: User-local NVM links updated for %s in %s\n' "$node_version" "$link_dir"
+)
+
+# Return nvm's failure, or the hook's status after a successful version switch.
+nvmh() {
+    if [[ ${1-} == use ]]; then
+        nvm "$@" || return $?
+        _nvm_post_use_hook
+    else
+        nvm "$@"
+    fi
+}
+
+nvm_deactivate() {
+    _nvm_writable_scalar PATH MANPATH NODE_PATH NVM_BIN NVM_INC BASHCMDR_NVM_LOADED || return 1
+    if declare -F nvm >/dev/null; then
+        # Upstream owns its PATH/MANPATH/NODE_PATH cleanup and NVM_BIN/NVM_INC.
+        # Retain NVM_DIR, nvm/nvmh and helpers; do not implicitly unload user NVM.
+        nvm deactivate --silent || return $?
+    fi
+    unset BASHCMDR_NVM_LOADED
+    _nvm_message success "NVM deactivated; functions/configuration and user-local links remain"
+}
+
+nvm_diagnose() {
+    local issues=0 version listing line line_count=0 link_dir
+    echo "=== NVM Cartridge Diagnostic ==="
+    if ! _nvm_configure; then
+        echo "=== Diagnostic Summary ==="
+        echo "NVM configuration invalid"
+        return 1
+    fi
+    if [[ -d ${NVM_CONFIG[dir]} ]]; then
+        echo "NVM directory found: ${NVM_CONFIG[dir]}"
+    else
+        echo "NVM directory not found: ${NVM_CONFIG[dir]}"
+        issues=$((issues + 1))
+    fi
+    if [[ -f ${NVM_CONFIG[script]} && -r ${NVM_CONFIG[script]} && -s ${NVM_CONFIG[script]} ]]; then
+        echo "NVM script present and readable (source not attempted)"
+    else
+        echo "NVM script not found or not a readable nonempty file: ${NVM_CONFIG[script]}"
+        issues=$((issues + 1))
+    fi
+    if declare -F nvm >/dev/null; then
+        if version=$(nvm --version 2>/dev/null) && [[ -n $version ]]; then
+            echo "NVM function available; version: $version"
+        else
+            echo "NVM version probe failed or returned no version"
+            issues=$((issues + 1))
+        fi
+        if listing=$(nvm list 2>/dev/null); then
+            echo "Installed Node versions (first ten lines):"
+            while IFS= read -r line; do
+                echo "  $line"
+                line_count=$((line_count + 1))
+                if ((line_count >= 10)); then break; fi
+            done <<< "$listing"
+        else
+            echo "NVM installed-version query failed"
+            issues=$((issues + 1))
+        fi
+    else
+        echo "NVM function not loaded; activation unverified"
+    fi
+    if [[ -f ${NVM_CONFIG[completion]} && -r ${NVM_CONFIG[completion]} ]]; then
+        echo "Optional completion file present (source not attempted)"
+    else
+        echo "Optional completion file unavailable"
+    fi
+    if ! link_dir=$(_nvm_link_directory); then
+        echo "Unsupported NVM link directory"
+        issues=$((issues + 1))
+    elif [[ ! -e $link_dir && ! -L $link_dir ]]; then
+        echo "User-local link directory will be created on first nvmh use: $link_dir"
+    elif [[ -d $link_dir && ! -L $link_dir && -O $link_dir && -w $link_dir ]]; then
+        echo "User-owned link directory writable: $link_dir"
+    else
+        echo "Link directory must be real, user-owned and writable: $link_dir"
+        issues=$((issues + 1))
+    fi
+    echo "=== Diagnostic Summary ==="
+    if ((issues)); then
+        echo "Found $issues issues; see https://github.com/nvm-sh/nvm#installing-and-updating"
+        return 1
+    fi
+    echo "All checks passed; source/activation and optional completion are not certified by diagnosis"
+    return 0
+}
+
+nvm_help() {
+    cat << 'EOF'
+NVM Loader Cartridge
+
+DESCRIPTION:
+  Integrates Node.js version management via nvm. Provides clean
+  Node.js environment switching and package management support.
+
+USAGE:
+  source main.bashcmdr; nvm_help
+  Bare checkout: bash main.bashcmdr help (activation requires console)
+
+ACTIONS:
+  setup      - Validate nvm installation
+  activate   - Load nvm into current shell
+  deactivate - Ask upstream to deactivate; retain functions/configuration
+  diagnose   - Run comprehensive health check
+  help       - Show this help message
+
+PROVIDED FUNCTIONALITY:
+  - NVM command line tool
+  - Node.js version switching
+  - NPM package management
+  - nvmh wrapper function with post-use hooks
+  - Bash completion support
+
+DEPENDENCIES:
+  - nvm installation at $NVM_DIR (default: $HOME/.nvm)
+
+INSTALLATION:
+  Follow current upstream instructions and review its installer:
+    https://github.com/nvm-sh/nvm#installing-and-updating
+  This cartridge does not install NVM or Node automatically.
+
+EXAMPLES:
+  nvm list                 # List installed Node.js versions (no hooks)
+  nvm install node         # Install latest Node.js
+  nvm install 18.17.0      # Install specific version
+  nvmh use node            # Switch to latest (with post-use hooks)
+  nvmh use 16.20.0         # Switch to specific version (with hooks)
+  nvm alias default node   # Set default version
+
+ENHANCED FEATURES:
+  - nvmh function runs post-use hooks after switching Node versions
+  - Automatic bash completion loading
+  - User-local symlinks in ~/.local/bin (override BASHCMDR_NVM_LINK_DIR)
+  - No sudo or automatic system-directory changes
+
+NOTES:
+  - NVM functions persist in shell after activation
+  - Deactivation calls nvm deactivate --silent; retains NVM_DIR and functions
+  - Upstream partial source/failure effects cannot be fully reversed here
+  - User-local shared links are retained on deactivation
+  - Post-use hooks run after successful version switches via nvmh
+  - Foreign files/links are preserved; hook failures make nvmh fail
+  - Links are shared by this user; existing shells may keep their own NVM PATH
+  - Use 'nvmh use' instead of 'nvm use' to trigger hooks
+
+EOF
+}
+
+# === DISPATCH SYSTEM ===
+
+cartridge_dispatch() {
+    local action="${1:-help}"
+    local func="${NVM_INTERFACE[$action]:-}"
+    
+    if [[ -n "$func" ]] && declare -f "$func" >/dev/null 2>&1; then
+        if (($#)); then shift; fi
+        if (($#)); then "$func" "$@"; else "$func"; fi
+    else
+        nvm_help
+        [[ -n "$func" ]] || _nvm_message error "Unknown action: $action"
+        return 1
+    fi
+}
+
+# Execute if called directly, or allow sourcing for function access
+if [[ ${BASH_SOURCE[0]} == "${0}" ]]; then
+    cartridge_dispatch "$@"
+fi

@@ -1,0 +1,45 @@
+name: Development checks
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  development:
+    # Linux development runner; product support requires separate final
+    # acceptance under the verified-target prerelease policy (Console docs/SUPPORT.md).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BASH_ENV: /dev/null
+      ENV: /dev/null
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Check out the cartridge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Initialize evidence directory
+        run: mkdir -p tests/results/ci
+      - name: Select development Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.14'
+      - name: Check out the exact Console compatibility input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: bashcmdr/console
+          ref: a5f1a33013a00aa48e548e07ce2397d8f3559948
+          path: .ci-inputs/console
+          persist-credentials: false
+      - name: Run required development checks
+        run: bash --noprofile --norc tests/ci.bash .ci-inputs/console
+      - name: Retain diagnostic evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nvm-development-checks
+          path: tests/results/ci/
+          if-no-files-found: error
+          retention-days: 14

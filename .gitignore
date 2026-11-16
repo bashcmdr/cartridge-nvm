@@ -1,0 +1,17 @@
+# Owned development output and the exact Console workflow input.
+/tests/results/
+/.ci-inputs/
+__pycache__/
+*.py[cod]
+
+# Local editor, agent and environment data.
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+/.claude/
+.env
+.env.local
+*.pem
+*.key

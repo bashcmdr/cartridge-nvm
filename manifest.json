@@ -1,0 +1,53 @@
+{
+  "name": "nvm-loader",
+  "version": "1.0.0",
+  "description": "Node.js version management via nvm integration",
+  "author": "bashcmdr-team",
+  "license": "Apache-2.0",
+  "copyright": "Copyright 2026 Eric Milgram",
+  "repository": "https://github.com/bashcmdr/cartridge-nvm",
+  "execution": {
+    "mode": "SOURCE_ONLY",
+    "guard_variable": "BASHCMDR_NVM_LOADED"
+  },
+  "requires": {
+    "bashcmdr": ">=1.0.0",
+    "cartridges": {}
+  },
+  "provides": {
+    "commands": [
+      "nvm"
+    ],
+    "environment": [
+      "NVM_DIR",
+      "BASHCMDR_NVM_LOADED"
+    ],
+    "functions": [
+      "nvm_setup",
+      "nvm_activate",
+      "nvm_deactivate",
+      "nvm_diagnose",
+      "nvm_help",
+      "nvmh"
+    ]
+  },
+  "dependencies": {
+    "external": {
+      "nvm": {
+        "binary": "nvm",
+        "required": false,
+        "description": "Shell function loaded from NVM_DIR/nvm.sh; NVM_DIR defaults to HOME/.nvm."
+      }
+    }
+  },
+  "testing": {
+    "test_script": "tests/ci.bash"
+  },
+  "lifecycle": {
+    "setup": "nvm_setup",
+    "activate": "nvm_activate",
+    "deactivate": "nvm_deactivate",
+    "diagnose": "nvm_diagnose",
+    "help": "nvm_help"
+  }
+}
